@@ -1,6 +1,6 @@
 # omp-settings-zh
 
-官方 [Oh My Pi（omp）](https://github.com/can1357/oh-my-pi) 的简体中文汉化插件。基于 [kaleidoscope416/oh-my-pi-zh](https://github.com/kaleidoscope416/oh-my-pi-zh) 19.1.0 的扩展 fork，不分叉官方代码、不修改任何二进制，通过 Extension 在进程内替换显示文案，随时可逆。
+官方 [Oh My Pi（omp）](https://github.com/can1357/oh-my-pi) 的简体中文汉化插件。不分叉官方代码、不修改任何二进制，通过 Extension 在进程内替换显示文案，随时可逆。
 
 **宿主要求**：omp 19.x（针对 19.1.0 校准，兼容预检 fail-closed，不匹配时自动回退英文，绝不弄坏 omp 本体）。
 
@@ -56,9 +56,9 @@ omp plugin install github:kaleidoscope416/oh-my-pi-zh
 /settings-language en     # 撤销，恢复官方文案
 ```
 
-## 与上游 fork 的差异
+## 扩展能力
 
-上游只覆盖官方 89 条注册表命令与设置面板。本 fork 额外做了：
+在设置面板与官方 89 条注册表命令的汉化之外：
 
 1. 注册表外命令翻译（`autoresearch` / `green` / `annotate` / `init`）
 2. 斜杠参数补全翻译（142 条，含别名归一化、`(current)` 标记、`(bundled)` 标签）
@@ -73,14 +73,8 @@ bun test            # 全部测试
 bun run check       # typecheck + test + coverage + drift + commands（smoke 需真实宿主，单独跑）
 ```
 
-同步上游：
-
-```sh
-git fetch upstream && git merge upstream/main
-```
-
-上游新增命令或参数时，`bun run commands:check` 会精确列出缺失与漂移条目。
+omp 官方新增命令或参数时，`bun run commands:check` 会精确列出缺失与漂移条目。
 
 ## 许可
 
-MIT。基于 kaleidoscope416/oh-my-pi-zh 与 can1357/oh-my-pi（MIT）派生，版权归原作者所有。
+MIT License，详见 [LICENSE](LICENSE)。
