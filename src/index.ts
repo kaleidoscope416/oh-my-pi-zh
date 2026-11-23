@@ -4,6 +4,7 @@ import type { ApplyTranslationsResult } from "./apply-translations";
 import { getHostMetadata } from "./host-adapter";
 import type { HostMetadata } from "./compatibility";
 import { zhCN } from "./translations/zh-CN";
+import { HotkeysSheetZh } from "./hotkeys";
 import { installLauncher, launcherBinDirectory, LAUNCHER_RECOVERED, withoutLauncherPath } from "./cli/install";
 import { localizeSlashAutocomplete } from "./slash-autocomplete";
 
@@ -51,6 +52,21 @@ const extension: ExtensionFactory = async (pi) => {
     transition = transition.then(() => changeLanguage(language));
     return transition;
   };
+
+  // /hotkeys 拦截：内置面板文案在宿主 bundle 内、扩展无法就地补丁；中文激活时改用
+  // 本插件按宿主实际键位重建的中文面板（src/hotkeys.ts），en 模式走官方原版。
+  // 键位管理器从 ui.custom() 工厂参数取——事件 context 不暴露它，而工厂拿到的是
+  // 宿主注册的同一实例（runner 初始化时存入 contextActions.keybindings）。
+  pi.on("input", async (event, context) => {
+    if (event.source !== "interactive" || !active || shuttingDown) return;
+    if (context.agent.kind !== "main" || context.mode !== "tui") return;
+    if (event.text.trim() !== "/hotkeys") return;
+    await context.ui.custom<undefined>(
+      (_tui, _theme, kb, done) => new HotkeysSheetZh({ keybindings: kb }, () => done(undefined)),
+      { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } },
+    );
+    return { handled: true };
+  });
 
   pi.on("session_start", async (_event, context) => {
     // Child sessions share the registry; they must not own or undo the parent's localization.

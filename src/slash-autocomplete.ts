@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { slashCommandTranslations, bundledCommandTranslations } from "./translations/slash-commands";
+import { subcommandTranslations } from "./translations/subcommands";
 
 type Provider = Parameters<Parameters<ExtensionContext["ui"]["addAutocompleteProvider"]>[0]>[0];
 type Suggestions = NonNullable<Awaited<ReturnType<Provider["getSuggestions"]>>>;
@@ -9,6 +10,10 @@ const translations = new Map<string, Translation>();
 for (const entry of [...slashCommandTranslations, ...bundledCommandTranslations]) {
   translations.set(entry.name, entry);
   if ("aliases" in entry) for (const alias of entry.aliases) translations.set(alias, entry);
+}
+const subTranslations = new Map<string, readonly [string, string]>();
+for (const [command, subs] of Object.entries(subcommandTranslations)) {
+  for (const [sub, [en, zh]] of Object.entries(subs)) subTranslations.set(command + " " + sub, [en, zh]);
 }
 
 const liveLabels: Record<string, readonly [string, string]> = {
@@ -102,9 +107,17 @@ function translateState(command: string, state: string): string {
   return state; // Model IDs, effort selectors and objectives stay literal.
 }
 
-function translateItem(item: Item): Item {
+function translateItem(item: Item, command: string, argumentMode: boolean): Item {
   if (item.value === "skill:" && item.description && /^\d+ skills?$/.test(item.description)) {
     return { ...item, description: item.description.replace(/^(\d+) skills?$/, "$1 项技能") };
+  }
+  // Argument completions: key on "<command> <sub>"; exact English match only, so
+  // upstream drift falls back to English instead of mistranslating (e.g. model
+  // names that coincide with a table string).
+  if (argumentMode) {
+    const entry = subTranslations.get(command + " " + item.value);
+    if (entry && item.description === entry[0]) return { ...item, description: entry[1] };
+    return item;
   }
   const entry = translations.get(item.value);
   if (!entry) return item;
@@ -130,12 +143,21 @@ function translateItem(item: Item): Item {
 /** Wrap only display results; the underlying provider still owns matching and insertion. */
 export function localizeSlashAutocomplete(current: Provider, isChinese: () => boolean): Provider {
   const originals = new WeakMap<Item, Item>();
-  const localize = (result: Suggestions | null): Suggestions | null => {
-    if (!result || !isChinese() || !/^\s*\/[^\s/]*$/.test(result.prefix)) return result;
+  const localize = (result: Suggestions | null, lines?: readonly string[], row?: number): Suggestions | null => {
+    if (!result || !isChinese()) return result;
+    // Slash context is judged from the edited line, not result.prefix — in
+    // argument contexts the provider reports only the fragment ("/mcp l" → "l").
+    const line = lines?.[row ?? 0] ?? "";
+    const commandMatch = /^\s*\/([^\s/]*)/.exec(line);
+    if (!commandMatch) return result;
+    const after = line.slice(commandMatch[0].length);
+    // "/usr/b" or "/local/open" paths: a second "/" before any space is not a builtin command.
+    if (after.length > 0 && !/^\s/.test(after)) return result;
+    const argumentMode = after.length > 0;
     let items: Item[] | undefined;
     for (let index = 0; index < result.items.length; index++) {
       const item = result.items[index]!;
-      const translated = translateItem(item);
+      const translated = translateItem(item, commandMatch[1]!, argumentMode);
       if (translated === item) continue;
       originals.set(translated, item);
       items ??= result.items.slice();
@@ -145,10 +167,10 @@ export function localizeSlashAutocomplete(current: Provider, isChinese: () => bo
   };
   return {
     getSuggestions: async (lines, row, col, signal, onPartial) => localize(await current.getSuggestions(
-      lines, row, col, signal, onPartial ? result => onPartial(localize(result)!) : undefined,
-    )),
+      lines, row, col, signal, onPartial ? result => onPartial(localize(result, lines, row)!) : undefined,
+    ), lines, row),
     applyCompletion: (lines, row, col, item, prefix) => current.applyCompletion(lines, row, col, originals.get(item) ?? item, prefix),
-    ...(current.trySyncSlashCompletion && { trySyncSlashCompletion: text => localize(current.trySyncSlashCompletion!(text)) }),
+    ...(current.trySyncSlashCompletion && { trySyncSlashCompletion: text => localize(current.trySyncSlashCompletion!(text), [text], 0) }),
     ...(current.trySyncModelMentionCompletion && { trySyncModelMentionCompletion: current.trySyncModelMentionCompletion.bind(current) }),
     ...(current.getInlineHint && { getInlineHint: current.getInlineHint.bind(current) }),
     ...(current.trySyncInlineReplace && { trySyncInlineReplace: current.trySyncInlineReplace.bind(current) }),

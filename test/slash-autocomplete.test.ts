@@ -21,6 +21,7 @@ import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
 import { theme } from "@oh-my-pi/pi-tui/theme/theme";
 import { localizeSlashAutocomplete } from "../src/slash-autocomplete";
 import { slashCommandTranslations } from "../src/translations/slash-commands";
+import { buildHotkeysRows, HotkeysSheetZh, type BindingKeySource } from "../src/hotkeys";
 
 const planDescription = "Toggle plan mode (agent plans before executing)";
 
@@ -50,23 +51,58 @@ test("live slash state updates in both completion paths and English restores the
 test("out-of-registry bundled commands translate, keep the (bundled) tag, and restore in English mode", async () => {
   let chinese = true;
   const native = new CombinedAutocompleteProvider([
-    { name: "autoresearch", description: "Toggle builtin autoresearch mode, or pass off / clear, or a goal message.", getAutocompleteDescription: () => "Autoresearch: off" },
+    { name: "autoresearch", description: "Toggle builtin autoresearch mode, or pass off / clear, or a goal message.", argumentHint: "[on|off]", getAutocompleteDescription: () => "Autoresearch: off" },
     { name: "green", description: "Generate a prompt to iterate on CI failures until the branch is green (bundled)" },
     { name: "annotate", description: "Annotate a diff or text from a file, prompt, latest reply, or session (bundled)" },
     { name: "init", description: "Generate AGENTS.md for current codebase" },
   ]);
   const provider = localizeSlashAutocomplete(native, () => chinese);
   const find = (name: string) => provider.trySyncSlashCompletion!("/" + name)!.items.find(item => item.value === name)!;
-  expect(find("autoresearch")!.description).toBe("自动研究：关闭");
+  expect(find("autoresearch")!.description).toBe("[on|off] - 自动研究：关闭");
   expect(find("green")!.description).toBe("生成提示词，迭代修复 CI 失败，直到分支变绿 (bundled)");
   expect(find("annotate")!.description).toBe("对来自文件、提示、最新回复或会话的差异或文本进行批注 (bundled)");
   expect(find("init")!.description).toBe("为当前代码库生成 AGENTS.md");
   chinese = false;
   expect(find("green")!.description).toBe("Generate a prompt to iterate on CI failures until the branch is green (bundled)");
-  expect(find("autoresearch")!.description).toBe("Autoresearch: off");
+  expect(find("autoresearch")!.description).toBe("[on|off] - Autoresearch: off");
 });
 
-test("command aliases translate but arguments, unknown commands and third-party overrides do not", async () => {
+test("argument completions translate per command and drift or other commands stay literal", async () => {
+  const native = new CombinedAutocompleteProvider([
+    { name: "mcp", description: "Manage MCP servers", getArgumentCompletions: () => [{ value: "list", label: "list", description: "List all configured MCP servers" }] },
+    { name: "ssh", description: "Manage SSH hosts", getArgumentCompletions: () => [{ value: "list", label: "list", description: "List all configured SSH hosts" }] },
+    // Same English string under a command with no table entry: must stay literal.
+    { name: "switch", description: "Switch roles", getArgumentCompletions: () => [{ value: "alpha/model-1", label: "alpha/model-1", description: "List all configured MCP servers" }] },
+    // English drift on a tabled entry: must stay literal.
+    { name: "goal", description: "Goal mode", getArgumentCompletions: () => [{ value: "pause", label: "pause", description: "Pause the current goal (reworded)" }] },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => true);
+  const first = async (text: string) => (await provider.getSuggestions([text], 0, text.length))!.items[0]!.description;
+  expect(await first("/mcp l")).toBe("列出所有已配置的 MCP 服务器");
+  expect(await first("/ssh l")).toBe("列出所有已配置的 SSH 主机");
+  expect(await first("/switch a")).toBe("List all configured MCP servers");
+  expect(await first("/goal p")).toBe("Pause the current goal (reworded)");
+});
+
+test("Chinese hotkeys sheet renders real binding data and closes on Esc", () => {
+  const source: BindingKeySource = {
+    keybindings: {
+      getDisplayString: () => "",
+      getKeys: action => (action === "app.plan.toggle" ? ["ctrl+p"] : []),
+      matchesCanonical: () => false,
+    },
+  };
+  const rows = buildHotkeysRows(source);
+  expect(rows[0]).toBe("键盘快捷键（Esc 关闭）");
+  expect(rows.some(line => line.trimStart().startsWith("Ctrl+P") && line.includes("切换计划模式"))).toBe(true);
+  expect(rows.some(line => line.includes("未绑定"))).toBe(true);
+  let closed = false;
+  const sheet = new HotkeysSheetZh(source, () => { closed = true; });
+  sheet.handleInput("\x1b");
+  expect(closed).toBe(true);
+});
+
+test("command aliases translate, unknown commands and untabled argument fixtures stay literal", async () => {
   const native = new CombinedAutocompleteProvider([
     { name: "setup", aliases: ["providers"], description: "Open provider setup" },
     { name: "custom", description: "Open settings menu" },
@@ -79,6 +115,7 @@ test("command aliases translate but arguments, unknown commands and third-party 
   expect(provider.trySyncSlashCompletion!("/custom")!.items[0]!.description).toBe("Open settings menu");
   expect(provider.trySyncSlashCompletion!("/plan")!.items[0]!.description).toBe("Plan: off");
   const args = await provider.getSuggestions(["/settings n"], 0, 11);
+  // settings/new is a fixture only; the registry declares no settings subcommands.
   expect(args!.items[0]!.description).toBe("Start a new session");
   const skills = await provider.getSuggestions(["/skill:custom"], 0, 13);
   expect(skills!.items[0]!.description).toBe("My custom skill");
