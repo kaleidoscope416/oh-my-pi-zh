@@ -1,0 +1,57 @@
+{
+  "name": "omp-settings-zh",
+  "version": "19.1.0",
+  "description": "Chinese settings and slash-command autocomplete localization, plus a bilingual Stats dashboard for official Oh My Pi — no fork or binary patch.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "homepage": "https://github.com/kaleidoscope416/oh-my-pi-zh#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaleidoscope416/oh-my-pi-zh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kaleidoscope416/oh-my-pi-zh/issues"
+  },
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "i18n",
+    "localization",
+    "chinese",
+    "typescript",
+    "developer-tools"
+  ],
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "coverage:check": "bun run scripts/check-coverage.ts",
+    "drift:check": "bun run scripts/diff-upstream.ts",
+    "commands:check": "bun run scripts/check-slash-commands.ts",
+    "smoke": "bun run scripts/smoke-extension.ts",
+    "check": "bun run typecheck && bun test && bun run coverage:check && bun run drift:check && bun run commands:check && bun run smoke"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=19.0.0 <20",
+    "@oh-my-pi/pi-utils": ">=19.0.0 <20"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "19.1.0",
+    "@oh-my-pi/pi-utils": "19.1.0",
+    "@types/bun": "latest",
+    "puppeteer-core": "25.3.0",
+    "typescript": "5.9.2"
+  },
+  "engines": {
+    "bun": ">=1.4.4"
+  }
+}

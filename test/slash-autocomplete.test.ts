@@ -1,0 +1,701 @@
+import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CombinedAutocompleteProvider, type AutocompleteProvider } from "@oh-my-pi/pi-tui";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { BUILTIN_SLASH_COMMAND_DEFS, buildTuiBuiltinSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import type { TuiSlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
+import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+import { cfgGoalEnabled } from "@oh-my-pi/pi-coding-agent/goals/settings";
+import { cfgSkillful } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgExtendedContext } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import { cfgBrowserEnabled, cfgBrowserHeadless } from "@oh-my-pi/pi-coding-agent/tools/browser/settings";
+import { cfgCycleOrder, cfgModelPresets, cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
+import { setActiveSymbolTheme } from "@oh-my-pi/pi-tui/theme/active-symbols";
+import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
+import { theme } from "@oh-my-pi/pi-tui/theme/theme";
+import { localizeSlashAutocomplete } from "../src/slash-autocomplete";
+import { slashCommandTranslations } from "../src/translations/slash-commands";
+
+const planDescription = "Toggle plan mode (agent plans before executing)";
+
+test("live slash state updates in both completion paths and English restores the original display", async () => {
+  let chinese = true;
+  let plan = "off";
+  const native = new CombinedAutocompleteProvider([
+    { name: "plan", description: planDescription, argumentHint: "[on|off]", getAutocompleteDescription: () => "Plan: " + plan },
+    { name: "settings", description: "Open settings menu" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const first = await provider.getSuggestions(["/plan"], 0, 5);
+  expect(first!.items[0]!.description).toBe("[on|off] - 计划：关闭");
+  expect(first!.items[0]!.nativeDetail).toBe("[on|off] - 切换计划模式（智能体先规划，再执行）");
+  expect(first!.items[0]!.state).toBe("关闭");
+  plan = "on (draft.md)";
+  expect(provider.trySyncSlashCompletion!("  /plan")!.items[0]!.description).toBe("[on|off] - 计划：开启（draft.md）");
+  const completion = provider.applyCompletion(["  /pl"], 0, 5, first!.items[0]!, "  /pl");
+  expect(completion.lines).toEqual(["  /plan "]);
+  chinese = false;
+  const original = provider.trySyncSlashCompletion!("/plan")!.items[0]!;
+  expect(original.description).toBe("[on|off] - Plan: on (draft.md)");
+  expect(original.state).toBe("on (draft.md)");
+  expect(original.nativeDetail).toBe("[on|off] - " + planDescription);
+});
+
+test("command aliases translate but arguments, unknown commands and third-party overrides do not", async () => {
+  const native = new CombinedAutocompleteProvider([
+    { name: "setup", aliases: ["providers"], description: "Open provider setup" },
+    { name: "custom", description: "Open settings menu" },
+    { name: "plan", description: "My custom plan", getAutocompleteDescription: () => "Plan: off" },
+    { name: "settings", description: "Open settings menu", getArgumentCompletions: () => [{ value: "new", label: "new", description: "Start a new session" }] },
+    { name: "skill:custom", description: "My custom skill" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => true);
+  expect(provider.trySyncSlashCompletion!("/providers")!.items[0]!.description).toBe("打开提供商配置");
+  expect(provider.trySyncSlashCompletion!("/custom")!.items[0]!.description).toBe("Open settings menu");
+  expect(provider.trySyncSlashCompletion!("/plan")!.items[0]!.description).toBe("Plan: off");
+  const args = await provider.getSuggestions(["/settings n"], 0, 11);
+  expect(args!.items[0]!.description).toBe("Start a new session");
+  const skills = await provider.getSuggestions(["/skill:custom"], 0, 13);
+  expect(skills!.items[0]!.description).toBe("My custom skill");
+  const root = await provider.getSuggestions(["/"], 0, 1);
+  expect(root!.items.find(item => item.value === "skill:")!.description).toBe("1 项技能");
+});
+
+test("official switch role order, picker-ranked models and thinking suffixes pass through in both languages", async () => {
+  const settings = Settings.isolated();
+  const models = ["alpha", "beta", "outside"].map((provider, index) => buildModel({
+    provider, id: "model-1", name: ["Open settings menu", "Start a new session", "Outside scope"][index]!,
+    api: "openai-completions", baseUrl: "http://127.0.0.1/v1", reasoning: true, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192,
+  }));
+  cfgModelRoles.override(settings, { default: "beta/model-1", smol: "alpha/model-1", plan: "beta/model-1" });
+  cfgCycleOrder.override(settings, ["smol", "default"]);
+  const session = {
+    scopedModels: models.slice(0, 2).map(model => ({ model })),
+    modelRegistry: {
+      getError: () => undefined, getAvailable: () => models, getAll: () => models,
+      // 18.20.1+ official completion retries failed provider discovery on each keystroke.
+      retryUnavailableDiscovery: () => undefined,
+    },
+    effectiveServiceTier: () => undefined,
+  };
+  const command = buildTuiBuiltinSlashCommands({ ctx: { settings, session } } as unknown as TuiSlashCommandRuntime)
+    .find(command => command.name === "switch")!;
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const check = async (query: string, values: string[]) => {
+    const text = "/switch " + query;
+    const original = (await native.getSuggestions([text], 0, text.length))!;
+    expect(original.items.map(item => item.value)).toEqual(values);
+    for (const language of [true, false]) {
+      chinese = language;
+      const result = (await provider.getSuggestions([text], 0, text.length))!;
+      expect(result).toEqual(original);
+      expect(provider.trySyncSlashCompletion!(text)).toBeNull();
+      for (let index = 0; index < result.items.length; index++) {
+        expect(provider.applyCompletion([text], 0, text.length, result.items[index]!, result.prefix))
+          .toEqual(native.applyCompletion([text], 0, text.length, original.items[index]!, original.prefix));
+      }
+    }
+    return original;
+  };
+  await check("@", ["@smol ", "@default ", "@plan "]);
+  await check("@SM:high", ["@smol:high "]);
+  const modelResult = await check("mdl:high", ["beta/model-1:high ", "alpha/model-1:high "]);
+  expect(modelResult.items.map(item => item.description)).toEqual(["Start a new session", "Open settings menu"]);
+  // The official cache must notice live scope changes; localization must not retain old candidates.
+  session.scopedModels = [{ model: models[2]! }];
+  await check("mdl:low", ["outside/model-1:low "]);
+  session.scopedModels = [];
+  const available = await provider.getSuggestions(["/switch mdl"], 0, 11);
+  expect(available!.items.map(item => item.value).sort()).toEqual(["alpha/model-1 ", "beta/model-1 ", "outside/model-1 "]);
+});
+
+test("official synchronous bare-slash and collapsed skill namespace match async results in both languages", async () => {
+  const native = new CombinedAutocompleteProvider([
+    ...BUILTIN_SLASH_COMMAND_DEFS,
+    { name: "skill:first", description: "Literal first skill" },
+    { name: "skill:second", description: "Literal second skill" },
+  ]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  for (const language of [true, false]) {
+    chinese = language;
+    for (const text of ["/", "  /", "/sk"]) {
+      const original = native.trySyncSlashCompletion(text)!;
+      expect(original).not.toBeNull();
+      const asyncResult = await native.getSuggestions([text], 0, text.length);
+      if (!asyncResult) throw new Error("Official slash suggestions are missing");
+      expect(original).toEqual(asyncResult);
+      const sync = provider.trySyncSlashCompletion!(text)!;
+      expect(await provider.getSuggestions([text], 0, text.length)).toEqual(sync);
+      expect(sync.items.map(item => item.value)).toEqual(original.items.map(item => item.value));
+      const namespace = sync.items.find(item => item.value === "skill:")!;
+      const originalNamespace = original.items.find(item => item.value === "skill:")!;
+      expect(namespace.description).toBe(language ? "2 项技能" : "2 skills");
+      expect(provider.applyCompletion([text], 0, text.length, namespace, sync.prefix))
+        .toEqual(native.applyCompletion([text], 0, text.length, originalNamespace, original.prefix));
+      if (!language) expect(sync).toEqual(original);
+    }
+    const text = "/skill:";
+    expect(await provider.getSuggestions([text], 0, text.length)).toEqual(await native.getSuggestions([text], 0, text.length));
+  }
+});
+
+test("official fork optional subcommands keep bare submission, English hints and insertion unchanged", async () => {
+  const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "fork")!;
+
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const text = "/fork";
+  const original = native.trySyncSlashCompletion(text)!;
+  const localized = provider.trySyncSlashCompletion!(text)!;
+  expect(localized.items[0]!.description).not.toBe(original.items[0]!.description);
+  expect(await provider.getSuggestions([text], 0, text.length)).toEqual(localized);
+  expect(provider.applyCompletion([text], 0, text.length, localized.items[0]!, localized.prefix))
+    .toEqual(native.applyCompletion([text], 0, text.length, original.items[0]!, original.prefix));
+  expect(command.getArgumentCompletions!("")).toBeNull();
+  expect(command.getInlineHint!("")).toBe("[pane|window|tab]");
+  const pane = (await command.getArgumentCompletions!("pa"))![0]!;
+  expect(pane.value).toBe("pane ");
+  expect(pane.hint).toBe("ne");
+  expect((await command.getArgumentCompletions!("window"))![0]!.hint).toBeUndefined();
+  for (const language of [true, false]) {
+    chinese = language;
+    for (const args of ["", "pa", "pane", "w", "window", "t", "tab", "pane ", "unknown"]) {
+      const input = text + " " + args;
+      const originalArgs = await native.getSuggestions([input], 0, input.length);
+      const localizedArgs = await provider.getSuggestions([input], 0, input.length);
+      expect(localizedArgs).toEqual(originalArgs);
+      expect(provider.trySyncSlashCompletion!(input)).toBeNull();
+      expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
+      for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
+        expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
+          .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
+      }
+    }
+  }
+  expect(provider.trySyncSlashCompletion!(text)).toEqual(original);
+});
+
+test("official local file completion preserves session scope, literal labels, encoded URLs and native insertion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-zh-local-"));
+  let artifactsDir = join(directory, "first");
+  const sessionManager = { getArtifactsDir: () => artifactsDir, getSessionId: () => "local-completion-test" };
+  try {
+    for (const [session, names] of [
+      ["first", ["Open settings menu", "设置 参数%#?.md"]],
+      ["second", ["Second session.md"]],
+    ] as const) {
+      const root = resolveLocalRoot({ getArtifactsDir: () => join(directory, session) });
+      await mkdir(root, { recursive: true });
+      for (const name of names) await writeFile(join(root, name), "literal fixture");
+    }
+    const command = buildTuiBuiltinSlashCommands({ ctx: { sessionManager } } as unknown as TuiSlashCommandRuntime)
+      .find(command => command.name === "local")!;
+    const native = new CombinedAutocompleteProvider([command]);
+    let chinese = true;
+    const provider = localizeSlashAutocomplete(native, () => chinese);
+    const text = "/local";
+    for (const language of [true, false]) {
+      chinese = language;
+      for (const args of ["", "Open", "local:/Open", "local://Open", "设置"]) {
+        const input = text + " " + args;
+        const result = (await provider.getSuggestions([input], 0, input.length))!;
+        expect(result.items.map(item => item.label).sort()).toEqual(args && args !== "设置"
+          ? ["Open settings menu"] : args ? ["设置 参数%#?.md"] : ["Open settings menu", "设置 参数%#?.md"]);
+        for (const item of result.items) {
+          const value = "local://" + encodeURIComponent(item.label);
+          expect(item.value).toBe(value);
+          expect(provider.applyCompletion([input], 0, input.length, item, result.prefix))
+            .toEqual({ lines: ["/local " + value], cursorLine: 0, cursorCol: 7 + value.length });
+        }
+      }
+    }
+    artifactsDir = join(directory, "second");
+    const refocused = (await provider.getSuggestions([text + " "], 0, text.length + 1))!;
+    expect(refocused.items).toEqual([{ value: "local://Second%20session.md", label: "Second session.md" }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("official required subcommand remainder hints stay literal in both languages", async () => {
+  const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "jobs")!;
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  for (const language of [true, false]) {
+    chinese = language;
+    for (const args of ["", "k", "kill", "kill "]) {
+      const input = "/jobs " + args;
+      const original = await native.getSuggestions([input], 0, input.length);
+      expect(await provider.getSuggestions([input], 0, input.length)).toEqual(original);
+      expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
+      if (args === "k") expect(original!.items[0]!.hint).toBe("ill <id>|all");
+      if (args === "kill") expect(original!.items[0]!.hint).toBe(" <id>|all");
+    }
+  }
+});
+
+test("official installed-plugin arguments and alias retain upstream English prose and plugin hints", async () => {
+  const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "plugins")!;
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  for (const language of [true, false]) {
+    chinese = language;
+    for (const name of ["plugins", "plugin"]) {
+      const text = "/" + name;
+      const original = native.trySyncSlashCompletion(text)!;
+      const localized = provider.trySyncSlashCompletion!(text)!;
+      expect(localized.items[0]!.description).toBe(language ? "查看和管理已安装插件" : original.items[0]!.description);
+      expect(provider.applyCompletion([text], 0, text.length, localized.items[0]!, localized.prefix))
+        .toEqual(native.applyCompletion([text], 0, text.length, original.items[0]!, original.prefix));
+      for (const args of ["", "l", "list", "e", "enable", "enable ", "d", "disable", "disable "]) {
+        const input = text + " " + args;
+        const originalArgs = await native.getSuggestions([input], 0, input.length);
+        const localizedArgs = await provider.getSuggestions([input], 0, input.length);
+        expect(localizedArgs).toEqual(originalArgs);
+        expect(provider.trySyncSlashCompletion!(input)).toBeNull();
+        expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
+        for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
+          expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
+            .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
+        }
+      }
+    }
+  }
+});
+
+test("official effort arguments follow live model selectors and retain current markers and literal values", async () => {
+  const settings = Settings.isolated();
+  let levels = ["off", "low", "high"];
+  let effort = "high";
+  const session = { configuredThinkingLevel: () => effort, getAvailableEffortSelectors: () => levels };
+  const context = {
+    settings,
+    session: { configuredThinkingLevel: () => "medium", getAvailableEffortSelectors: () => ["medium"] },
+    viewSession: session,
+  };
+  const command = buildTuiBuiltinSlashCommands({ ctx: context } as unknown as TuiSlashCommandRuntime)
+    .find(command => command.name === "effort")!;
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  for (const language of [true, false]) {
+    chinese = language;
+    levels = ["off", "low", "high"]; effort = "high";
+    expect(provider.trySyncSlashCompletion!("/effort")!.items[0]!.state).toBe("high");
+    for (const args of ["", "o", "off", "h", "high", "x"]) {
+      const input = "/effort " + args;
+      const original = await native.getSuggestions([input], 0, input.length);
+      const result = await provider.getSuggestions([input], 0, input.length);
+      expect(result).toEqual(original);
+      expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
+      for (let index = 0; index < (original?.items.length ?? 0); index++) {
+        expect(provider.applyCompletion([input], 0, input.length, result!.items[index]!, result!.prefix))
+          .toEqual(native.applyCompletion([input], 0, input.length, original!.items[index]!, original!.prefix));
+      }
+      if (args === "") {
+        expect(result!.items.map(item => item.value)).toEqual(["off ", "low ", "high "]);
+        expect(result!.items.find(item => item.value === "high ")!.description).toEndWith(" (current)");
+      }
+    }
+    levels = ["low"]; effort = "low";
+    expect((await provider.getSuggestions(["/effort "], 0, 8))!.items.map(item => item.value)).toEqual(["low "]);
+    expect(provider.getInlineHint!(["/effort h"], 0, 9)).toBeNull();
+    levels = [];
+    expect(command.getArgumentCompletions!("")).toBeNull();
+  }
+  context.viewSession = context.session;
+  expect(provider.trySyncSlashCompletion!("/effort")!.items[0]!.state).toBe("medium");
+  const refocused = (await provider.getSuggestions(["/effort "], 0, 8))!;
+  expect(refocused.items.map(item => item.value)).toEqual(["medium "]);
+  expect(refocused.items[0]!.description).toEndWith(" (current)");
+});
+
+test("official prewalk model handoff arguments and restart hints stay literal in both languages", async () => {
+  const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "prewalk")!;
+  const native = new CombinedAutocompleteProvider([command]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const text = "/prewalk";
+  const original = native.trySyncSlashCompletion(text)!;
+  const localized = provider.trySyncSlashCompletion!(text)!;
+  expect(await provider.getSuggestions([text], 0, text.length)).toEqual(localized);
+  expect(provider.applyCompletion([text], 0, text.length, localized.items[0]!, localized.prefix))
+    .toEqual(native.applyCompletion([text], 0, text.length, original.items[0]!, original.prefix));
+  for (const language of [true, false]) {
+    chinese = language;
+    for (const args of ["", "o", "off", "r", "restart", "restart ", "restart @planning ", "restart @planning provider/model:high", "provider/model:high"]) {
+      const input = text + " " + args;
+      const originalArgs = await native.getSuggestions([input], 0, input.length);
+      const localizedArgs = await provider.getSuggestions([input], 0, input.length);
+      expect(localizedArgs).toEqual(originalArgs);
+      expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
+      expect(provider.trySyncSlashCompletion!(input)).toBeNull();
+      for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
+        expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
+          .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
+      }
+    }
+  }
+  expect(provider.trySyncSlashCompletion!(text)).toEqual(original);
+});
+test("key glyph changes in official descriptions preserve the key and do not disable live translation", async () => {
+  let key = "⌥P";
+  const native = new CombinedAutocompleteProvider([
+    { name: "switch", get description() { return `Switch model for this session (same as ${key}); accepts fuzzy ids, provider/id, @role, :level`; }, getAutocompleteDescription: () => "Model: openai/demo" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => true);
+  const first = provider.trySyncSlashCompletion!("/switch")!.items[0]!;
+  expect(first.description).toBe("模型：openai/demo");
+  expect(first.nativeDetail).toBe("切换当前会话的模型（同 ⌥P）；支持模糊 ID、provider/id、@role、:level");
+  key = "Alt+P";
+  const second = (await provider.getSuggestions(["/switch"], 0, 7))!.items[0]!;
+  expect(second.nativeDetail).toBe("切换当前会话的模型（同 Alt+P）；支持模糊 ID、provider/id、@role、:level");
+});
+
+test("effort key glyphs preserve the shortcut, effort selector and English restore", async () => {
+  let chinese = true;
+  const native = new CombinedAutocompleteProvider([
+    { name: "effort", description: "Set reasoning effort (thinking level, intelligence) for this session; ⇧⇥ cycles levels", getAutocompleteDescription: () => "Thinking: high" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const sync = provider.trySyncSlashCompletion!("/effort")!.items[0]!;
+  expect(sync.description).toBe("思考：high");
+  expect(sync.nativeDetail).toBe("设置当前会话的推理强度（思考级别、智能程度）；⇧⇥ 循环切换级别");
+  expect(sync.state).toBe("high");
+  expect((await provider.getSuggestions(["/effort"], 0, 7))!.items[0]).toEqual(sync);
+  expect(provider.applyCompletion(["/eff"], 0, 4, sync, "/eff")).toEqual(native.applyCompletion(["/eff"], 0, 4, native.trySyncSlashCompletion("/effort")!.items[0]!, "/eff"));
+  chinese = false;
+  expect(provider.trySyncSlashCompletion!("/effort")).toEqual(native.trySyncSlashCompletion("/effort"));
+});
+
+
+test("official live callbacks cover every state family without changing matching or insertion", async () => {
+  const settings = Settings.isolated();
+  let goal: { goal: { status: string; objective: string } } | undefined;
+  let model: { provider: string; id: string } | undefined;
+  let fast = false, ultra = false, slow = false;
+  let effort: string | undefined;
+  const advisors: { active: boolean; configured: boolean; advisors: string[]; model: { provider: string; id: string } | undefined } = { active: false, configured: false, advisors: [], model };
+  let tools: string[] = [], allTools: string[] = [];
+  let usage: { percent: number; tokens: number; contextWindow: number } | undefined;
+  let jobs: { running: string[]; recent: string[] } | undefined;
+  let pendingLogin = false, loginProvider: string | undefined;
+  const ctx = {
+    settings, planModeEnabled: false, goalModeEnabled: false, vibeModeEnabled: false,
+    planModePlanFilePath: undefined as string | undefined,
+    loopModeEnabled: false, loopModePaused: false, loopPrompt: undefined as string | undefined,
+    loopLimit: undefined as { kind: "iterations"; remaining: number; initial: number } | { kind: "duration"; durationMs: number; deadlineMs: number } | undefined,
+    loopCondition: undefined as { until: boolean; command: string } | undefined,
+    collabController: { host: undefined as { participants: string[] } | undefined },
+    collabGuest: undefined as { readOnly: boolean } | undefined,
+    todoPhases: [] as { tasks: { status: string }[] }[],
+    oauthManualInput: { hasPending: () => pendingLogin, get pendingProviderId() { return loginProvider; } },
+    get viewSession() { return this.session; },
+    session: {
+      settings, get model() { return model; }, isStreaming: false,
+      getGoalModeState: () => goal, isFastModeEnabled: () => fast, isUltrafastModeEnabled: () => ultra,
+      isSlowModeEnabled: () => slow, configuredThinkingLevel: () => effort, getAdvisorStats: () => advisors,
+      getActiveToolNames: () => tools, getAllToolNames: () => allTools,
+      getContextUsage: () => usage, getAsyncJobSnapshot: () => jobs,
+    },
+  };
+  const native = new CombinedAutocompleteProvider([...buildTuiBuiltinSlashCommands({ ctx } as unknown as TuiSlashCommandRuntime)]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const covered = new Set<string>();
+  const check = async (name: string, englishState: string, chineseState: string) => {
+    covered.add(name);
+    const text = "/" + name;
+    const original = native.trySyncSlashCompletion(text)!.items.find(item => item.value === name)!;
+    expect(original.state).toBe(englishState);
+    const sync = provider.trySyncSlashCompletion!(text)!.items.find(item => item.value === name)!;
+    const asyncItem = (await provider.getSuggestions([text], 0, text.length))!.items.find(item => item.value === name)!;
+    expect(sync.state).toBe(chineseState);
+    expect(asyncItem).toEqual(sync);
+    expect(sync.description).not.toBe(original.description);
+    expect(sync.value).toBe(original.value);
+    expect(provider.applyCompletion([text], 0, text.length, sync, text)).toEqual(native.applyCompletion([text], 0, text.length, original, text));
+    chinese = false;
+    expect(provider.trySyncSlashCompletion!(text)).toEqual(native.trySyncSlashCompletion(text));
+    chinese = true;
+  };
+  cfgPlanEnabled.override(settings, false);
+  await check("plan", "disabled in settings", "已在设置中禁用");
+  cfgPlanEnabled.override(settings, true);
+  await check("plan", "off", "关闭");
+  ctx.goalModeEnabled = true;
+  await check("plan", "blocked by goal mode", "目标模式启用中，无法开启");
+  ctx.goalModeEnabled = false; ctx.planModeEnabled = true;
+  await check("plan", "on", "开启");
+  ctx.planModePlanFilePath = "/tmp/do-not-translate.md";
+  await check("plan", "on (do-not-translate.md)", "开启（do-not-translate.md）");
+  await check("plan-review", "available", "可用");
+  await check("vibe", "blocked by plan mode", "计划模式启用中，无法开启");
+  cfgGoalEnabled.override(settings, false);
+  await check("goal", "disabled in settings", "已在设置中禁用");
+  cfgGoalEnabled.override(settings, true);
+  await check("goal", "blocked by plan mode", "计划模式启用中，无法开启");
+  ctx.planModeEnabled = false;
+  await check("plan-review", "plan mode inactive", "计划模式未启用");
+  await check("vibe", "off", "关闭");
+  ctx.goalModeEnabled = true;
+  await check("vibe", "blocked by goal mode", "目标模式启用中，无法开启");
+  ctx.vibeModeEnabled = true;
+  await check("vibe", "on", "开启");
+  await check("goal", "off", "关闭");
+  for (const [status, zh] of [["active", "进行中"], ["paused", "已暂停"], ["budget-limited", "预算受限"], ["complete", "已完成"], ["dropped", "已放弃"]]) {
+    goal = { goal: { status: status!, objective: "Literal objective" } };
+    await check("goal", status + " (Literal objective)", zh + " (Literal objective)");
+  }
+  await check("loop", "off", "关闭");
+  ctx.loopModeEnabled = true; ctx.loopModePaused = true;
+  await check("loop", "paused", "已暂停");
+  ctx.loopModePaused = false;
+  await check("loop", "on (waiting for next prompt)", "开启（等待下一条提示）");
+  ctx.loopPrompt = "literal prompt";
+  await check("loop", "on (repeating prompt)", "开启（重复提示）");
+  ctx.loopLimit = { kind: "iterations", remaining: 1, initial: 1 };
+  await check("loop", "on (1 of 1 iteration remaining)", "开启（共 1 轮，剩余 1 轮）");
+  ctx.loopLimit = { kind: "iterations", remaining: 2, initial: 5 };
+  await check("loop", "on (2 of 5 iterations remaining)", "开启（共 5 轮，剩余 2 轮）");
+  for (const [durationMs, english, zh] of [[3600000, "1 hour", "1 小时"], [7200000, "2 hours", "2 小时"], [60000, "1 minute", "1 分钟"], [120000, "2 minutes", "2 分钟"], [1000, "1 second", "1 秒"], [1500, "1.5 seconds", "1.5 秒"]] as const) {
+    ctx.loopLimit = { kind: "duration", durationMs, deadlineMs: 0 };
+    await check("loop", "on (" + english + " limit)", "开启（限时 " + zh + "）");
+  }
+  ctx.loopLimit = undefined;
+  for (const until of [true, false]) {
+    ctx.loopCondition = { until, command: "echo literal" };
+    const condition = (until ? "until" : "while") + " `echo literal` succeeds";
+    const zh = (until ? "直到命令成功：" : "命令成功时继续：") + "`echo literal`";
+    await check("loop", "on (" + condition + ")", "开启（" + zh + "）");
+    ctx.loopLimit = { kind: "iterations", remaining: 2, initial: 5 };
+    await check("loop", "on (2 of 5 iterations remaining, " + condition + ")", "开启（共 5 轮，剩余 2 轮，" + zh + "）");
+    ctx.loopLimit = { kind: "duration", durationMs: 1500, deadlineMs: 0 };
+    await check("loop", "on (1.5 seconds limit, " + condition + ")", "开启（限时 1.5 秒，" + zh + "）");
+    ctx.loopLimit = undefined;
+  }
+  for (const name of ["model", "switch"]) {
+    model = undefined; await check(name, "none selected", "未选择");
+    model = { provider: "openai", id: "literal-id:high" }; await check(name, "openai/literal-id:high", "openai/literal-id:high");
+  }
+  await check("fast", "off", "关闭"); fast = true;
+  await check("fast", "on", "开启"); ultra = true;
+  await check("fast", "ultra", "超快");
+  await check("slow", "off", "关闭"); slow = true; await check("slow", "on", "开启");
+  for (const [handle, name] of [[cfgSkillful, "skillful"], [cfgExtendedContext, "extended-context"], [cfgComputerEnabled, "computer"]] as const) {
+    handle.override(settings, false); await check(name, "off", "关闭");
+    handle.override(settings, true); await check(name, "on", "开启");
+  }
+  await check("modelpreset", "none saved", "尚未保存");
+  cfgModelPresets.override(settings, { demo: { modelRoles: {} }, other: { modelRoles: {} } });
+  await check("modelpreset", "2 saved", "已保存 2 项");
+  await check("effort", "model default", "模型默认");
+  for (const value of ["off", "auto", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    effort = value; await check("effort", value, value);
+  }
+  await check("advisor", "off", "关闭"); advisors.configured = true;
+  await check("advisor", "configured, no model", "已配置，未选择模型");
+  advisors.active = true; advisors.model = model;
+  await check("advisor", "on (openai/literal-id:high)", "开启（openai/literal-id:high）");
+  advisors.advisors = ["one", "two"]; await check("advisor", "on (2 advisors)", "开启（2 位顾问）");
+  await check("collab", "off", "关闭"); await check("leave", "not in collab", "未加入协作");
+  ctx.collabGuest = { readOnly: true }; await check("collab", "read-only guest", "只读访客");
+  await check("leave", "guest", "访客"); ctx.collabGuest.readOnly = false; await check("collab", "guest", "访客");
+  ctx.collabController.host = { participants: ["host", "guest"] };
+  await check("collab", "hosting (1 guests)", "主持中（1 位访客）"); await check("leave", "hosting", "主持中");
+  cfgBrowserEnabled.override(settings, false); await check("browser", "disabled", "已禁用");
+  cfgBrowserEnabled.override(settings, true); cfgBrowserHeadless.override(settings, true); await check("browser", "headless", "无头");
+  cfgBrowserHeadless.override(settings, false); await check("browser", "visible", "可见");
+  await check("login", "choose provider", "选择提供商"); pendingLogin = true;
+  await check("login", "waiting for OAuth callback", "等待 OAuth 回调"); loginProvider = "literal-provider";
+  await check("login", "waiting for literal-provider callback", "等待 literal-provider 回调");
+  await check("force", "no active tools", "无启用的工具"); tools = ["read", "bash"]; await check("force", "2 active tools", "2 个启用的工具");
+  await check("fresh", "ready", "就绪"); await check("clear", "drop context, keep session", "清空上下文，保留会话");
+  ctx.session.isStreaming = true;
+  await check("fresh", "unavailable while streaming", "流式输出期间不可用"); await check("clear", "unavailable while streaming", "流式输出期间不可用");
+  await check("compact", "context unavailable", "上下文不可用"); await check("context", "unavailable", "不可用");
+  usage = { percent: 42.4, tokens: 424, contextWindow: 1000 };
+  await check("compact", "context 42% used", "上下文已使用 42%");
+  await check("context", "42% (424/1,000)", "42% (424/1,000)");
+  await check("todo", "none", "无"); ctx.todoPhases = [{ tasks: [{ status: "pending" }, { status: "in_progress" }, { status: "completed" }] }];
+  await check("todo", "2 open (1 in progress, 1 done)", "2 项未完成（1 项进行中，1 项已完成）");
+  await check("jobs", "none", "无"); jobs = { running: [], recent: [] }; await check("jobs", "none", "无");
+  jobs = { running: ["literal-job"], recent: ["previous", "other"] }; await check("jobs", "1 running, 2 recent", "1 项运行中，2 项最近任务");
+  await check("tools", "none available", "无可用工具"); allTools = ["read", "bash", "edit"]; await check("tools", "2 active / 3 available", "2 个启用 / 3 个可用");
+  expect([...covered].sort()).toEqual(BUILTIN_SLASH_COMMAND_DEFS.filter(command => command.getTuiAutocompleteDescription).map(command => command.name).sort());
+});
+
+test("partial results, cancellation, original item identity and optional provider capabilities are transparent", async () => {
+  const native = new CombinedAutocompleteProvider([{ name: "plan", description: planDescription, getAutocompleteDescription: () => "Plan: off" }]);
+  const result = native.trySyncSlashCompletion("/plan")!;
+  const applied = { lines: ["native"], cursorLine: 0, cursorCol: 6, onApplied: () => {} };
+  const lines = ["/plan"];
+  const controller = new AbortController();
+  const fileResult = { items: [{ value: "plan", label: "file", description: planDescription }], prefix: "./" };
+  let chinese = true;
+  let receivedPartial: typeof result | undefined;
+  const current: AutocompleteProvider = {
+    async getSuggestions(receivedLines, row, col, signal, onPartial) {
+      expect(this).toBe(current); expect(receivedLines).toBe(lines);
+      expect([row, col]).toEqual([0, 5]); expect(signal).toBe(controller.signal);
+      if (signal!.aborted) return null;
+      onPartial?.(result);
+      await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true }));
+      return null;
+    },
+    applyCompletion(receivedLines, row, col, item, prefix) {
+      expect(this).toBe(current); expect(receivedLines).toBe(lines);
+      expect([row, col, prefix]).toEqual([0, 5, "/plan"]); expect(item).toBe(result.items[0]!);
+      return applied;
+    },
+    trySyncSlashCompletion(text) { expect(this).toBe(current); expect(text).toBe("/plan"); return result; },
+    getInlineHint(receivedLines, row, col) { expect(this).toBe(current); expect(receivedLines).toBe(lines); expect([row, col]).toEqual([0, 5]); return "literal hint"; },
+    trySyncInlineReplace(text) { expect(this).toBe(current); expect(text).toBe("literal"); return { replaceLen: 7, insert: "replacement" }; },
+    async getForceFileSuggestions(receivedLines, row, col, signal) { expect(this).toBe(current); expect(receivedLines).toBe(lines); expect([row, col]).toEqual([0, 5]); expect(signal).toBe(controller.signal); return fileResult; },
+    shouldTriggerFileCompletion(receivedLines, row, col) { expect(this).toBe(current); expect(receivedLines).toBe(lines); expect([row, col]).toEqual([0, 5]); return true; },
+  };
+  const provider = localizeSlashAutocomplete(current, () => chinese);
+  const pending = provider.getSuggestions(lines, 0, 5, controller.signal, partial => { receivedPartial = partial; });
+  expect(receivedPartial!.items[0]!.state).toBe("关闭");
+  expect(provider.applyCompletion(lines, 0, 5, receivedPartial!.items[0]!, "/plan")).toBe(applied);
+  chinese = false;
+  expect(provider.trySyncSlashCompletion!("/plan")).toBe(result);
+  expect(provider.applyCompletion(lines, 0, 5, receivedPartial!.items[0]!, "/plan")).toBe(applied);
+  expect(provider.getInlineHint!(lines, 0, 5)).toBe("literal hint");
+  expect(provider.trySyncInlineReplace!("literal")).toEqual({ replaceLen: 7, insert: "replacement" });
+  expect(await provider.getForceFileSuggestions!(lines, 0, 5, controller.signal)).toBe(fileResult);
+  expect(provider.shouldTriggerFileCompletion!(lines, 0, 5)).toBe(true);
+  controller.abort(); expect(await pending).toBeNull();
+  expect(await provider.getSuggestions(lines, 0, 5, controller.signal)).toBeNull();
+  const bare = localizeSlashAutocomplete({ getSuggestions: current.getSuggestions, applyCompletion: current.applyCompletion }, () => true);
+  for (const capability of ["trySyncSlashCompletion", "getInlineHint", "trySyncInlineReplace", "getForceFileSuggestions", "shouldTriggerFileCompletion"] as const) expect(capability in bare).toBe(false);
+});
+
+
+test("all official commands and aliases preserve ranking and completion in both languages", async () => {
+  // Static inventory uses no live runtime; the official registry retains descriptions and aliases.
+  const staticNative = new CombinedAutocompleteProvider([...BUILTIN_SLASH_COMMAND_DEFS]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(staticNative, () => chinese);
+  const original = (await staticNative.getSuggestions(["/"], 0, 1))!;
+  const localized = (await provider.getSuggestions(["/"], 0, 1))!;
+  expect(localized.items.map(item => item.value)).toEqual(original.items.map(item => item.value));
+  const identifiers = BUILTIN_SLASH_COMMAND_DEFS.flatMap(command => [command.name, ...(command.aliases ?? [])]);
+  for (const name of identifiers) {
+    const text = "/" + name;
+    const originalItem = staticNative.trySyncSlashCompletion(text)!.items.find(item => item.value === name)!;
+    const sync = provider.trySyncSlashCompletion!(text)!.items.find(item => item.value === name)!;
+    const asyncItem = (await provider.getSuggestions([text], 0, text.length))!.items.find(item => item.value === name)!;
+    expect(sync.description).not.toBe(originalItem.description);
+    expect(asyncItem).toEqual(sync);
+    expect(sync.label).toBe(originalItem.label);
+    expect(sync.icon).toBe(originalItem.icon);
+    expect(sync.iconName).toBe(originalItem.iconName);
+    expect(provider.applyCompletion([text], 0, text.length, sync, text)).toEqual(staticNative.applyCompletion([text], 0, text.length, originalItem, text));
+  }
+  chinese = false;
+  expect(await provider.getSuggestions(["/"], 0, 1)).toEqual(original);
+});
+
+test("official context and hub description hits retain browse-only flags while the subagents alias remains runnable", async () => {
+  const native = new CombinedAutocompleteProvider([...BUILTIN_SLASH_COMMAND_DEFS]);
+  let chinese = true;
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  for (const [query, value, descriptionOnly] of [
+    ["/detailed", "context", true],
+    ["/finished", "hub", true],
+    ["/subagents", "subagents", false],
+  ] as const) {
+    const original = native.trySyncSlashCompletion(query)!;
+    const originalItem = original.items.find(item => item.value === value)!;
+    expect(originalItem).toBeDefined();
+    expect(originalItem.descriptionMatch === true).toBe(descriptionOnly);
+    for (const language of [true, false]) {
+      chinese = language;
+      const result = provider.trySyncSlashCompletion!(query)!;
+      const item = result.items.find(item => item.value === value)!;
+      expect(await provider.getSuggestions([query], 0, query.length)).toEqual(result);
+      expect(result.items.map(item => item.value)).toEqual(original.items.map(item => item.value));
+      expect(item.descriptionMatch).toBe(originalItem.descriptionMatch);
+      expect(item.description === originalItem.description).toBe(!language);
+      expect(provider.applyCompletion([query], 0, query.length, item, result.prefix))
+        .toEqual(native.applyCompletion([query], 0, query.length, originalItem, original.prefix));
+      if (!language) expect(result).toEqual(original);
+    }
+  }
+});
+
+test("known shortcuts may vary but changed surrounding prose and third-party descriptions remain English", async () => {
+  for (const name of ["switch", "loop", "effort"]) {
+    const command = slashCommandTranslations.find(command => command.name === name)!;
+    const key = name === "switch" ? "Option+P" : name === "loop" ? "Esc" : "Shift+Tab";
+    const base = command.en;
+    for (const description of [base.replace(key, "CustomKey"), "Changed " + base, base + " Changed", base.replace(key, "CustomKey") + " Changed"]) {
+      const native = new CombinedAutocompleteProvider([{ name, description, getAutocompleteDescription: () => name === "switch" ? "Model: provider/id" : name === "loop" ? "Loop: off" : "Thinking: high" }]);
+      const provider = localizeSlashAutocomplete(native, () => true);
+      const text = "/" + name;
+      const english = native.trySyncSlashCompletion(text)!;
+      const translated = provider.trySyncSlashCompletion!(text)!;
+      if (description === base.replace(key, "CustomKey")) {
+        expect(translated.items[0]!.nativeDetail).toContain("CustomKey");
+        expect(translated.items[0]!.nativeDetail).not.toBe(english.items[0]!.nativeDetail);
+      } else expect(translated).toEqual(english);
+      expect(await provider.getSuggestions([text], 0, text.length)).toEqual(translated);
+    }
+  }
+  const native = new CombinedAutocompleteProvider([
+    { name: "skill:first", description: "literal first skill" }, { name: "skill:second", description: "literal second skill" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => true);
+  expect((await provider.getSuggestions(["/"], 0, 1))!.items.find(item => item.value === "skill:")!.description).toBe("2 项技能");
+  expect(provider.trySyncSlashCompletion!("/skill:first")).toEqual(native.trySyncSlashCompletion("/skill:first"));
+});
+
+test("official key getters follow actual symbol presets for switch, loop and effort in both completion paths", async () => {
+  const previousTheme = theme;
+  const observed = new Set<string>();
+  try {
+    for (const preset of ["ascii", "unicode", "nerd"] as const) {
+      setActiveSymbolTheme(loadThemeSync("dark", { symbolPresetOverride: preset }));
+      const keys = { switch: formatKeyHint("alt+p"), loop: formatKeyHint("escape"), effort: formatKeyHint("shift+tab") };
+      observed.add(keys.effort);
+      const commands = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime)
+        .filter(command => command.name === "switch" || command.name === "loop" || command.name === "effort");
+      // Exercise actual getter-derived text; live session state is verified in the compiled TUI.
+      const native = new CombinedAutocompleteProvider(commands.map(({ getAutocompleteDescription: _live, ...command }) => command));
+      let chinese = true;
+      const provider = localizeSlashAutocomplete(native, () => chinese);
+      for (const name of ["switch", "loop", "effort"] as const) {
+        const text = "/" + name;
+        const original = native.trySyncSlashCompletion(text)!;
+        const sync = provider.trySyncSlashCompletion!(text)!;
+        const item = sync.items.find(item => item.value === name)!;
+        expect(item.description).toContain(keys[name]);
+        expect(item.description).not.toBe(original.items.find(item => item.value === name)!.description);
+        expect(await provider.getSuggestions([text], 0, text.length)).toEqual(sync);
+        expect(provider.applyCompletion([text], 0, text.length, item, sync.prefix))
+          .toEqual(native.applyCompletion([text], 0, text.length, original.items.find(item => item.value === name)!, original.prefix));
+        chinese = false;
+        expect(provider.trySyncSlashCompletion!(text)).toEqual(original);
+        chinese = true;
+      }
+    }
+    expect(observed.size).toBe(3);
+  } finally {
+    setActiveSymbolTheme(previousTheme);
+  }
+});
+

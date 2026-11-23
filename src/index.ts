@@ -1,0 +1,107 @@
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent";
+import { applyTranslations } from "./apply-translations";
+import type { ApplyTranslationsResult } from "./apply-translations";
+import { getHostMetadata } from "./host-adapter";
+import type { HostMetadata } from "./compatibility";
+import { zhCN } from "./translations/zh-CN";
+import { installLauncher, launcherBinDirectory, LAUNCHER_RECOVERED, withoutLauncherPath } from "./cli/install";
+import { localizeSlashAutocomplete } from "./slash-autocomplete";
+
+const extension: ExtensionFactory = async (pi) => {
+  // Synchronously, before any await: the official update.auto worker inherits this PATH
+  // and replaces its first omp, which must not be the managed launcher.
+  if (process.env.HOME && process.env.PATH !== undefined) {
+    process.env.PATH = withoutLauncherPath(process.env.PATH, launcherBinDirectory(process.env.HOME));
+  }
+  let launcherNotice = (await installLauncher()).startsWith(LAUNCHER_RECOVERED);
+  let host: HostMetadata | undefined;
+  let active: Extract<ApplyTranslationsResult, { status: "applied" }> | undefined;
+  let restoreError: string | undefined;
+  let transition = Promise.resolve<string | undefined>(undefined);
+  let autocompleteRegistered = false;
+  let shuttingDown = false;
+
+  const changeLanguage = async (language: "en" | "zh"): Promise<string | undefined> => {
+    if (language === "en") {
+      if (!active) return;
+      const errors = active.restore();
+      if (errors.length > 0) return restoreError = errors.join("；");
+      active = undefined;
+      restoreError = undefined;
+      return;
+    }
+    if (shuttingDown) return;
+    if (active) return restoreError;
+    try {
+      host ??= await getHostMetadata();
+      if (shuttingDown) return;
+      const result = applyTranslations(host, zhCN);
+      if (result.status !== "applied") {
+        return result.status === "rolled-back" && result.rollbackErrors.length > 0
+          ? result.reason + "；回滚错误：" + result.rollbackErrors.join("；")
+          : result.reason;
+      }
+      active = result;
+    } catch (error) {
+      return "宿主接口加载失败：" + (error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const setLanguage = (language: "en" | "zh") => {
+    transition = transition.then(() => changeLanguage(language));
+    return transition;
+  };
+
+  pi.on("session_start", async (_event, context) => {
+    // Child sessions share the registry; they must not own or undo the parent's localization.
+    if (context.agent.kind !== "main" || shuttingDown) return;
+    if (!autocompleteRegistered) {
+      context.ui.addAutocompleteProvider(current => localizeSlashAutocomplete(current, () => !!active));
+      autocompleteRegistered = true;
+    }
+    const reason = await setLanguage("zh");
+    if (reason) context.ui.notify("omp-settings-zh 设置汉化失败：" + reason, "warning");
+    if (launcherNotice) {
+      launcherNotice = false;
+      context.ui.notify("omp-settings-zh：官方更新曾安装到 Stats 启动器位置，已恢复启动器；官方 OMP 仍为原位置版本，下次官方更新将安装到原位置。", "warning");
+    }
+  });
+
+  pi.registerCommand("settings-language", {
+    description: "切换设置与内置命令补全的显示语言：zh（中文）或 en（原版）",
+    handler: async (args, context) => {
+      if (context.agent.kind !== "main") {
+        context.ui.notify("设置语言由主会话管理。", "warning");
+        return;
+      }
+      if (shuttingDown) return;
+      let language = args.trim();
+      if (!language) {
+        const choice = await context.ui.select(
+          "Settings language / 设置语言（当前：" + (restoreError ? "恢复未完成" : active ? "中文" : "原版") + "）",
+          ["简体中文", "Original（原版）"],
+        );
+        if (!choice || shuttingDown) return;
+        language = choice === "简体中文" ? "zh" : "en";
+      }
+      if (language !== "en" && language !== "zh") {
+        context.ui.notify("用法：/settings-language [zh|en]", "warning");
+        return;
+      }
+      const reason = await setLanguage(language);
+      context.ui.notify(reason
+        ? "设置语言切换失败：" + reason
+        : "设置与命令补全已切换为" + (language === "zh" ? "中文" : "原版") + "，重新打开 /settings 或补全列表即可。",
+        reason ? "warning" : "info");
+    },
+  });
+
+  pi.on("session_shutdown", async (_event, context) => {
+    if (context.agent.kind !== "main") return;
+    shuttingDown = true;
+    const reason = await setLanguage("en");
+    if (reason) context.ui.notify("设置原文恢复失败：" + reason, "warning");
+  });
+};
+
+export default extension;
