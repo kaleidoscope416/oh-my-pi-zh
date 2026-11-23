@@ -473,3 +473,31 @@ export const slashCommandTranslations = [
     "zh": "退出应用"
   }
 ] as const;
+
+/**
+ * Host commands outside BUILTIN_SLASH_COMMAND_DEFS: bundled commands (green/annotate/…,
+ * whose "(bundled)" display tag the matcher strips) and out-of-registry mode toggles.
+ * Gated by the extra sources in scripts/check-slash-commands.ts.
+ */
+export const bundledCommandTranslations = [
+  {
+    "name": "autoresearch",
+    "en": "Toggle builtin autoresearch mode, or pass off / clear, or a goal message.",
+    "zh": "切换内置自动研究模式，或传 off / clear，或一条目标消息"
+  },
+  {
+    "name": "green",
+    "en": "Generate a prompt to iterate on CI failures until the branch is green",
+    "zh": "生成提示词，迭代修复 CI 失败，直到分支变绿"
+  },
+  {
+    "name": "annotate",
+    "en": "Annotate a diff or text from a file, prompt, latest reply, or session",
+    "zh": "对来自文件、提示、最新回复或会话的差异或文本进行批注"
+  },
+  {
+    "name": "init",
+    "en": "Generate AGENTS.md for current codebase",
+    "zh": "为当前代码库生成 AGENTS.md"
+  }
+] as const;

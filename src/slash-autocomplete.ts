@@ -1,12 +1,12 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { slashCommandTranslations } from "./translations/slash-commands";
+import { slashCommandTranslations, bundledCommandTranslations } from "./translations/slash-commands";
 
 type Provider = Parameters<Parameters<ExtensionContext["ui"]["addAutocompleteProvider"]>[0]>[0];
 type Suggestions = NonNullable<Awaited<ReturnType<Provider["getSuggestions"]>>>;
 type Item = Suggestions["items"][number];
 type Translation = { name: string; aliases?: readonly string[]; en: string; zh: string };
 const translations = new Map<string, Translation>();
-for (const entry of slashCommandTranslations) {
+for (const entry of [...slashCommandTranslations, ...bundledCommandTranslations]) {
   translations.set(entry.name, entry);
   if ("aliases" in entry) for (const alias of entry.aliases) translations.set(alias, entry);
 }
@@ -16,7 +16,7 @@ const liveLabels: Record<string, readonly [string, string]> = {
   goal: ["Goal", "目标"], loop: ["Loop", "循环"], model: ["Model", "模型"], switch: ["Model", "模型"],
   fast: ["Fast", "快速服务"], slow: ["Slow mode", "慢速模式"], skillful: ["Skill listing", "技能列表"],
   "extended-context": ["Extended context", "扩展上下文"], computer: ["Computer", "电脑控制"],
-  modelpreset: ["Presets", "预设"], effort: ["Thinking", "思考"], advisor: ["Advisor", "顾问"],
+  modelpreset: ["Presets", "预设"], effort: ["Thinking", "思考"], advisor: ["Advisor", "顾问"], autoresearch: ["Autoresearch", "自动研究"],
   collab: ["Collab", "协作"], leave: ["Leave collab", "离开协作"], browser: ["Browser", "浏览器"],
   login: ["Login", "登录"], force: ["Force", "强制工具"], fresh: ["Fresh", "流状态重置"],
   clear: ["Clear", "清空上下文"], compact: ["Compact", "上下文压缩"], todo: ["Todos", "待办"],
@@ -53,6 +53,17 @@ export function staticText(text: string | undefined, entry: Translation): { pref
   if (!key || key.includes("\n")) return;
   const prefix = text.slice(0, start);
   return { prefix, translated: prefix + entry.zh.replace(keySource, key) };
+}
+
+const bundledSuffix = " (bundled)";
+
+/** staticText plus the transparent "(bundled)" display tag the host appends for bundled commands. */
+function staticTextLoose(text: string | undefined, entry: Translation) {
+  if (text === undefined) return undefined;
+  const tagged = text.endsWith(bundledSuffix);
+  const match = staticText(tagged ? text.slice(0, -bundledSuffix.length) : text, entry);
+  if (!match) return undefined;
+  return { prefix: match.prefix, translated: match.translated + (tagged ? bundledSuffix : "") };
 }
 
 function translateState(command: string, state: string): string {
@@ -101,8 +112,9 @@ function translateItem(item: Item): Item {
   let nativeDetail = item.nativeDetail;
   let state = item.state;
   // Official text must match outside the known dynamic key-hint placeholders.
-  const staticDetail = staticText(nativeDetail, entry);
-  description = staticText(description, entry)?.translated ?? description;
+  const staticDetail = staticTextLoose(nativeDetail, entry);
+  const descriptionMatch = staticTextLoose(description, entry);
+  if (descriptionMatch) description = descriptionMatch.translated;
   if (staticDetail) nativeDetail = staticDetail.translated;
   const labels = liveLabels[entry.name];
   const livePrefix = (staticDetail?.prefix ?? "") + (labels?.[0] ?? "") + ": ";

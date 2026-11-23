@@ -47,6 +47,25 @@ test("live slash state updates in both completion paths and English restores the
   expect(original.nativeDetail).toBe("[on|off] - " + planDescription);
 });
 
+test("out-of-registry bundled commands translate, keep the (bundled) tag, and restore in English mode", async () => {
+  let chinese = true;
+  const native = new CombinedAutocompleteProvider([
+    { name: "autoresearch", description: "Toggle builtin autoresearch mode, or pass off / clear, or a goal message.", getAutocompleteDescription: () => "Autoresearch: off" },
+    { name: "green", description: "Generate a prompt to iterate on CI failures until the branch is green (bundled)" },
+    { name: "annotate", description: "Annotate a diff or text from a file, prompt, latest reply, or session (bundled)" },
+    { name: "init", description: "Generate AGENTS.md for current codebase" },
+  ]);
+  const provider = localizeSlashAutocomplete(native, () => chinese);
+  const find = (name: string) => provider.trySyncSlashCompletion!("/" + name)!.items.find(item => item.value === name)!;
+  expect(find("autoresearch")!.description).toBe("自动研究：关闭");
+  expect(find("green")!.description).toBe("生成提示词，迭代修复 CI 失败，直到分支变绿 (bundled)");
+  expect(find("annotate")!.description).toBe("对来自文件、提示、最新回复或会话的差异或文本进行批注 (bundled)");
+  expect(find("init")!.description).toBe("为当前代码库生成 AGENTS.md");
+  chinese = false;
+  expect(find("green")!.description).toBe("Generate a prompt to iterate on CI failures until the branch is green (bundled)");
+  expect(find("autoresearch")!.description).toBe("Autoresearch: off");
+});
+
 test("command aliases translate but arguments, unknown commands and third-party overrides do not", async () => {
   const native = new CombinedAutocompleteProvider([
     { name: "setup", aliases: ["providers"], description: "Open provider setup" },
