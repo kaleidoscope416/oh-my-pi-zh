@@ -3,6 +3,7 @@ import { formatKeyHint, keyHintPlatform } from "@oh-my-pi/pi-tui/app-keybindings
 import type { KeyName } from "@oh-my-pi/pi-tui/key-hint-format";
 import { matchesSelectCancel } from "@oh-my-pi/pi-tui/keybinding-matchers";
 import { canonicalKeyId } from "@oh-my-pi/pi-tui/keybindings";
+import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 
 /**
  * Chinese rebuild of the `/hotkeys` reference (pi-tui `hotkeys-markdown.ts`).
@@ -142,25 +143,37 @@ export function buildHotkeysRows(source: BindingKeySource): string[] {
 	return lines;
 }
 
-/** Minimal focused overlay component; Esc (or any select-cancel chord) dismisses. */
+/**
+ * Full-width sheet: horizontal rules and per-row fill so the panel spans the
+ * overlay width (CJK-aware via visibleWidth) instead of floating short text
+ * with blank margins on both sides.
+ */
 export class HotkeysSheetZh {
-	#lines: readonly string[] | undefined;
+	#source: BindingKeySource;
+	#onClose: () => void;
+	#rows: readonly string[] | undefined;
 
-	constructor(
-		readonly source: BindingKeySource,
-		readonly onClose: () => void,
-	) {}
+	constructor(source: BindingKeySource, onClose: () => void) {
+		this.#source = source;
+		this.#onClose = onClose;
+	}
 
-	render(): readonly string[] {
-		this.#lines ??= buildHotkeysRows(this.source);
-		return this.#lines;
+	render(width: number): readonly string[] {
+		this.#rows ??= buildHotkeysRows(this.#source);
+		const rule = "─".repeat(Math.max(0, width));
+		const rows: string[] = [rule, truncateToWidth(this.#rows[0] ?? "", width, null, true), rule];
+		for (const line of this.#rows.slice(1)) {
+			rows.push(line === "" ? rule : truncateToWidth(line, width, null, true));
+		}
+		rows.push(rule);
+		return rows;
 	}
 
 	invalidate(): void {
-		this.#lines = undefined;
+		this.#rows = undefined;
 	}
 
 	handleInput(data: string): void {
-		if (matchesSelectCancel(data)) this.onClose();
+		if (matchesSelectCancel(data)) this.#onClose();
 	}
 }

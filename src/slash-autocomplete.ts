@@ -115,8 +115,19 @@ function translateItem(item: Item, command: string, argumentMode: boolean): Item
   // upstream drift falls back to English instead of mistranslating (e.g. model
   // names that coincide with a table string).
   if (argumentMode) {
-    const entry = subTranslations.get(command + " " + item.value);
-    if (entry && item.description === entry[0]) return { ...item, description: entry[1] };
+    // Real builders append an insertion space to value ("/mcp" → value "list "),
+    // and effort completions mark the active level with a " (current)" suffix —
+    // strip both for lookup and re-attach the marker translated.
+    const marker = " (current)";
+    let description = item.description;
+    let markerSuffix = "";
+    if (description?.endsWith(marker)) {
+      description = description.slice(0, -marker.length);
+      markerSuffix = "（当前）";
+    }
+    // Aliases: resolve the typed word to its canonical command name ("/plugin" → "plugins").
+    const entry = subTranslations.get((translations.get(command)?.name ?? command) + " " + item.value.trim());
+    if (entry && description === entry[0]) return { ...item, description: entry[1] + markerSuffix };
     return item;
   }
   const entry = translations.get(item.value);

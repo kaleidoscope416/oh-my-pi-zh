@@ -21,9 +21,49 @@ import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
 import { theme } from "@oh-my-pi/pi-tui/theme/theme";
 import { localizeSlashAutocomplete } from "../src/slash-autocomplete";
 import { slashCommandTranslations } from "../src/translations/slash-commands";
+import { subcommandTranslations } from "../src/translations/subcommands";
 import { buildHotkeysRows, HotkeysSheetZh, type BindingKeySource } from "../src/hotkeys";
+import { truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui/utils";
 
 const planDescription = "Toggle plan mode (agent plans before executing)";
+
+/**
+ * New contract: argument items translate when "<command> <sub>" is tabled and
+ * the English source matches exactly; every other field (value, label, hint,
+ * order, insertion) and every untabled item stays byte-identical to the host.
+ */
+async function expectArgsFollowOfficial(
+  command: string,
+  native: CombinedAutocompleteProvider,
+  provider: { getSuggestions: CombinedAutocompleteProvider["getSuggestions"]; applyCompletion: CombinedAutocompleteProvider["applyCompletion"] },
+  input: string,
+  translate: boolean,
+): Promise<void> {
+  const originalArgs = await native.getSuggestions([input], 0, input.length);
+  const localizedArgs = await provider.getSuggestions([input], 0, input.length);
+  if (!originalArgs || !localizedArgs) {
+    expect(localizedArgs ?? null).toEqual(originalArgs ?? null);
+    return;
+  }
+  expect(localizedArgs.prefix).toBe(originalArgs.prefix);
+  expect(localizedArgs.items.map(item => item.value)).toEqual(originalArgs.items.map(item => item.value));
+  const table = subcommandTranslations as Record<string, Record<string, readonly [string, string]>>;
+  for (const [index, original] of originalArgs.items.entries()) {
+    const localized = localizedArgs.items[index]!;
+    const entry = translate ? table[command]?.[String(original.value).trim()] : undefined;
+    if (entry && original.description === entry[0]) {
+      expect(localized).toEqual({ ...original, description: entry[1] });
+    } else if (entry && original.description === entry[0] + " (current)") {
+      expect(localized).toEqual({ ...original, description: entry[1] + "（当前）" });
+    } else {
+      expect(localized).toEqual(original);
+    }
+  }
+  for (const [index, original] of originalArgs.items.entries()) {
+    expect(provider.applyCompletion([input], 0, input.length, localizedArgs.items[index]!, localizedArgs.prefix))
+      .toEqual(native.applyCompletion([input], 0, input.length, original, originalArgs.prefix));
+  }
+}
 
 test("live slash state updates in both completion paths and English restores the original display", async () => {
   let chinese = true;
@@ -69,7 +109,8 @@ test("out-of-registry bundled commands translate, keep the (bundled) tag, and re
 
 test("argument completions translate per command and drift or other commands stay literal", async () => {
   const native = new CombinedAutocompleteProvider([
-    { name: "mcp", description: "Manage MCP servers", getArgumentCompletions: () => [{ value: "list", label: "list", description: "List all configured MCP servers" }] },
+    // Real builders append an insertion space to value ("list ").
+    { name: "mcp", description: "Manage MCP servers", getArgumentCompletions: () => [{ value: "list ", label: "list", description: "List all configured MCP servers" }] },
     { name: "ssh", description: "Manage SSH hosts", getArgumentCompletions: () => [{ value: "list", label: "list", description: "List all configured SSH hosts" }] },
     // Same English string under a command with no table entry: must stay literal.
     { name: "switch", description: "Switch roles", getArgumentCompletions: () => [{ value: "alpha/model-1", label: "alpha/model-1", description: "List all configured MCP servers" }] },
@@ -96,8 +137,11 @@ test("Chinese hotkeys sheet renders real binding data and closes on Esc", () => 
   expect(rows[0]).toBe("键盘快捷键（Esc 关闭）");
   expect(rows.some(line => line.trimStart().startsWith("Ctrl+P") && line.includes("切换计划模式"))).toBe(true);
   expect(rows.some(line => line.includes("未绑定"))).toBe(true);
-  let closed = false;
   const sheet = new HotkeysSheetZh(source, () => { closed = true; });
+  const rendered = sheet.render(80);
+  expect(rendered[0]).toBe("─".repeat(80));
+  expect(rendered.every(line => visibleWidth(line) === 80)).toBe(true);
+  let closed = false;
   sheet.handleInput("\x1b");
   expect(closed).toBe(true);
 });
@@ -205,7 +249,7 @@ test("official synchronous bare-slash and collapsed skill namespace match async 
   }
 });
 
-test("official fork optional subcommands keep bare submission, English hints and insertion unchanged", async () => {
+test("official fork optional subcommands: tabled descriptions translate, hints and insertion unchanged", async () => {
   const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "fork")!;
 
   const native = new CombinedAutocompleteProvider([command]);
@@ -228,15 +272,9 @@ test("official fork optional subcommands keep bare submission, English hints and
     chinese = language;
     for (const args of ["", "pa", "pane", "w", "window", "t", "tab", "pane ", "unknown"]) {
       const input = text + " " + args;
-      const originalArgs = await native.getSuggestions([input], 0, input.length);
-      const localizedArgs = await provider.getSuggestions([input], 0, input.length);
-      expect(localizedArgs).toEqual(originalArgs);
+      await expectArgsFollowOfficial("fork", native, provider, input, language);
       expect(provider.trySyncSlashCompletion!(input)).toBeNull();
       expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
-      for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
-        expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
-          .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
-      }
     }
   }
   expect(provider.trySyncSlashCompletion!(text)).toEqual(original);
@@ -284,7 +322,7 @@ test("official local file completion preserves session scope, literal labels, en
   }
 });
 
-test("official required subcommand remainder hints stay literal in both languages", async () => {
+test("official jobs subcommand hints stay literal; tabled descriptions translate in both languages", async () => {
   const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "jobs")!;
   const native = new CombinedAutocompleteProvider([command]);
   let chinese = true;
@@ -293,16 +331,15 @@ test("official required subcommand remainder hints stay literal in both language
     chinese = language;
     for (const args of ["", "k", "kill", "kill "]) {
       const input = "/jobs " + args;
-      const original = await native.getSuggestions([input], 0, input.length);
-      expect(await provider.getSuggestions([input], 0, input.length)).toEqual(original);
+      await expectArgsFollowOfficial("jobs", native, provider, input, language);
       expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
-      if (args === "k") expect(original!.items[0]!.hint).toBe("ill <id>|all");
-      if (args === "kill") expect(original!.items[0]!.hint).toBe(" <id>|all");
+      if (args === "k") expect((await native.getSuggestions([input], 0, input.length))!.items[0]!.hint).toBe("ill <id>|all");
+      if (args === "kill") expect((await native.getSuggestions([input], 0, input.length))!.items[0]!.hint).toBe(" <id>|all");
     }
   }
 });
 
-test("official installed-plugin arguments and alias retain upstream English prose and plugin hints", async () => {
+test("official installed-plugin arguments: tabled descriptions translate, plugin hints and name items stay literal", async () => {
   const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "plugins")!;
   const native = new CombinedAutocompleteProvider([command]);
   let chinese = true;
@@ -318,21 +355,15 @@ test("official installed-plugin arguments and alias retain upstream English pros
         .toEqual(native.applyCompletion([text], 0, text.length, original.items[0]!, original.prefix));
       for (const args of ["", "l", "list", "e", "enable", "enable ", "d", "disable", "disable "]) {
         const input = text + " " + args;
-        const originalArgs = await native.getSuggestions([input], 0, input.length);
-        const localizedArgs = await provider.getSuggestions([input], 0, input.length);
-        expect(localizedArgs).toEqual(originalArgs);
+        await expectArgsFollowOfficial("plugins", native, provider, input, language);
         expect(provider.trySyncSlashCompletion!(input)).toBeNull();
         expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
-        for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
-          expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
-            .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
-        }
       }
     }
   }
 });
 
-test("official effort arguments follow live model selectors and retain current markers and literal values", async () => {
+test("official effort arguments follow live model selectors and keep values and current markers", async () => {
   const settings = Settings.isolated();
   let levels = ["off", "low", "high"];
   let effort = "high";
@@ -353,17 +384,12 @@ test("official effort arguments follow live model selectors and retain current m
     expect(provider.trySyncSlashCompletion!("/effort")!.items[0]!.state).toBe("high");
     for (const args of ["", "o", "off", "h", "high", "x"]) {
       const input = "/effort " + args;
-      const original = await native.getSuggestions([input], 0, input.length);
-      const result = await provider.getSuggestions([input], 0, input.length);
-      expect(result).toEqual(original);
+      await expectArgsFollowOfficial("effort", native, provider, input, language);
       expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
-      for (let index = 0; index < (original?.items.length ?? 0); index++) {
-        expect(provider.applyCompletion([input], 0, input.length, result!.items[index]!, result!.prefix))
-          .toEqual(native.applyCompletion([input], 0, input.length, original!.items[index]!, original!.prefix));
-      }
+      const result = await provider.getSuggestions([input], 0, input.length);
       if (args === "") {
         expect(result!.items.map(item => item.value)).toEqual(["off ", "low ", "high "]);
-        expect(result!.items.find(item => item.value === "high ")!.description).toEndWith(" (current)");
+        expect(result!.items.find(item => item.value === "high ")!.description).toEndWith(language ? "（当前）" : " (current)");
       }
     }
     levels = ["low"]; effort = "low";
@@ -379,7 +405,7 @@ test("official effort arguments follow live model selectors and retain current m
   expect(refocused.items[0]!.description).toEndWith(" (current)");
 });
 
-test("official prewalk model handoff arguments and restart hints stay literal in both languages", async () => {
+test("official prewalk model handoff arguments: tabled descriptions translate, remainder hints stay literal", async () => {
   const command = buildTuiBuiltinSlashCommands({} as TuiSlashCommandRuntime).find(command => command.name === "prewalk")!;
   const native = new CombinedAutocompleteProvider([command]);
   let chinese = true;
@@ -394,15 +420,9 @@ test("official prewalk model handoff arguments and restart hints stay literal in
     chinese = language;
     for (const args of ["", "o", "off", "r", "restart", "restart ", "restart @planning ", "restart @planning provider/model:high", "provider/model:high"]) {
       const input = text + " " + args;
-      const originalArgs = await native.getSuggestions([input], 0, input.length);
-      const localizedArgs = await provider.getSuggestions([input], 0, input.length);
-      expect(localizedArgs).toEqual(originalArgs);
+      await expectArgsFollowOfficial("prewalk", native, provider, input, language);
       expect(provider.getInlineHint!([input], 0, input.length)).toBe(native.getInlineHint([input], 0, input.length));
       expect(provider.trySyncSlashCompletion!(input)).toBeNull();
-      for (let index = 0; index < (originalArgs?.items.length ?? 0); index++) {
-        expect(provider.applyCompletion([input], 0, input.length, localizedArgs!.items[index]!, localizedArgs!.prefix))
-          .toEqual(native.applyCompletion([input], 0, input.length, originalArgs!.items[index]!, originalArgs!.prefix));
-      }
     }
   }
   expect(provider.trySyncSlashCompletion!(text)).toEqual(original);

@@ -63,7 +63,7 @@ const extension: ExtensionFactory = async (pi) => {
     if (event.text.trim() !== "/hotkeys") return;
     await context.ui.custom<undefined>(
       (_tui, _theme, kb, done) => new HotkeysSheetZh({ keybindings: kb }, () => done(undefined)),
-      { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } },
+      { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "95%" } },
     );
     return { handled: true };
   });
